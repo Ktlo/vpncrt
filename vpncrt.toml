@@ -1,0 +1,30 @@
+[main]
+
+## Certificate properties (will appear in common name field)
+organisation = 'Organisation'
+organisation-unit = 'VPN Service OU'
+
+## Email addresses for second layer certificates
+email-domain = 'example.com'
+
+## Server domain and port for OpenVPN configuration file
+#server = 'example.com:1194'
+server = 'example.com'
+
+## Configuration variants.
+## These can be used for different OpenVPN settings.
+[variants]
+
+[variants.tcp]
+
+## Default is UDP protocol
+protocol = 'tcp'
+
+[variants.mobile]
+protocol = 'tcp'
+
+## Default is 'tap' devise
+devtype = 'tun'
+
+## Different server for 'mobile' variant
+server = 'example.com:1195'

@@ -1,0 +1,1346 @@
+#!/usr/bin/env python3
+
+from io import BufferedReader, BufferedWriter
+import argparse, sys, sqlite3, toml, re, hashlib, base64, os, datetime, tabulate, csv, io
+from cryptography.hazmat.primitives.asymmetric.dh import DHParameters, generate_parameters
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from sqlite3.dbapi2 import Cursor
+from typing import Optional, TextIO, Tuple, Union, Any, Mapping, List
+from dataclasses import dataclass
+from contextlib import closing
+from cryptography import x509
+from cryptography.x509.name import Name
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from cryptography.hazmat.primitives import hashes
+
+one_day = datetime.timedelta(1, 0, 0)
+
+class OpenVPNSecretKey:
+	def __init__(self, pem: Union[bytes, str]):
+		if isinstance(pem, bytes):
+			string = str(pem, 'ascii')
+		string = string.strip() + '\n'
+		pem = bytes(string, 'ascii')
+		self._pem = pem
+
+	@property
+	def pem(self):
+		return self._pem
+
+@dataclass
+class OpenVPNConfiguration:
+	content: bytes
+
+@dataclass
+class Configuration:
+	organisation: str
+	organisation_unit: str
+	email_domain: str
+	server: str
+	storage: str
+	devtype: str
+	protocol: str
+	email: Optional[str]
+
+def check_user_name(name: str):
+	for c in name:
+		if c not in "0123456789_-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
+			raise ValueError(f"user name has illegal characters: {name}")
+
+def check_host_name(name: str):
+	for c in name:
+		if c not in "0123456789_-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.":
+			raise ValueError("host name has illegal characters")
+
+def check_host_user_name(name: str) -> Tuple[str, str]:
+	i = name.find('@')
+	if i == -1:
+		raise ValueError("wrong host name")
+	user = name[0:i]
+	host = name[i+1:]
+	check_user_name(user)
+	check_host_name(host)
+	return user, host
+
+def load_configuration(file: str, variant: Union[str, None]) -> Configuration:
+	properties = toml.load(file)
+	main = properties["main"]
+	if variant is None:
+		selected = {}
+	else:
+		selected: Mapping[str, None] = properties["variants"][variant]
+	def get(name: str, default = None):
+		if name in selected.keys():
+			return selected[name]
+		if name in main.keys():
+			return main[name]
+		if default is not None:
+			return default
+		raise ValueError(f"property \"{name}\" not declared")
+	organisation = get("organisation")
+	organisation_unit = get("organisation-unit")
+	email_domain = get("email-domain")
+	server = get("server")
+	storage = get("storage", "vpncrt.db")
+	devtype = get("devtype", "tap")
+	protocol = get("protocol", "udp")
+	email = get("email", object())
+	if not isinstance(email, str):
+		email = None
+	return Configuration(organisation, organisation_unit, email_domain, server, storage, devtype, protocol, email)
+
+class Context:
+	def __init__(self, config: Configuration) -> None:
+		self.storage: sqlite3.Connection = sqlite3.connect(config.storage)
+		self.config: Configuration = config
+
+	def cursor(self) -> closing[Cursor]:
+		return closing(self.storage.cursor())
+
+stdin_not_free=False
+
+script = """
+PRAGMA FOREIGN_KEYS=ON;
+
+CREATE TABLE IF NOT EXISTS super (
+	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT
+);
+
+CREATE TABLE IF NOT EXISTS certs (
+	serial BLOB NOT NULL PRIMARY KEY,
+	owner INTEGER NOT NULL REFERENCES super ON DELETE CASCADE,
+	fingerprint TEXT NOT NULL UNIQUE,
+	revoked BOOLEAN NOT NULL DEFAULT false,
+	data BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS keys (
+	owner INTEGER NOT NULL PRIMARY KEY REFERENCES super ON DELETE CASCADE,
+	fingerprint TEXT NOT NULL UNIQUE,
+	public BLOB NOT NULL,
+	private BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+	id INTEGER NOT NULL PRIMARY KEY REFERENCES super ON DELETE CASCADE,
+	user TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS hosts (
+	id INTEGER NOT NULL PRIMARY KEY REFERENCES super ON DELETE CASCADE,
+	"user" INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+	host TEXT NOT NULL,
+	UNIQUE("user", host)
+);
+
+CREATE TABLE IF NOT EXISTS extras (
+	key TEXT NOT NULL PRIMARY KEY,
+	value BLOB
+) WITHOUT ROWID;
+"""
+
+
+nodetypes = [
+	'CA', 'TA', 'DH', 'USER', 'HOST'
+]
+
+def new_super(cursor: Cursor) -> int:
+	cursor.execute('INSERT INTO super DEFAULT VALUES;')
+	cursor.execute('SELECT max(id) FROM super;')
+	print('INFO: new super record', file=sys.stderr)
+	return cursor.fetchone()[0]
+
+def prepare_database(context: Context):
+	with context.cursor() as c:
+		c: Cursor
+		c.executescript(script)
+		c.execute('SELECT exists(SELECT 1 FROM super WHERE id = 1);')
+		if c.fetchone()[0] == 0:
+			result = new_super(c)
+			assert result == 1
+	context.storage.commit()
+	os.chmod(context.config.storage, 0o600)
+
+def get_nodetype(name: str) -> str:
+	if name == '#CA':
+		return 'CA'
+	elif name == '#TA':
+		return 'TA'
+	elif name == '#DH':
+		return 'DH'
+	elif '@' in name:
+		return 'HOST'
+	else:
+		return 'USER'
+
+def get_user(context: Context, user: str) -> Optional[int]:
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('SELECT id FROM users WHERE user = ?;', (user,))
+		result = cursor.fetchone()
+		if result is None:
+			return None
+		else:
+			return result[0]
+
+def get_host(context: Context, user: str, host: str) -> int:
+	user_id = place_user(context, user)
+	if user_id is None:
+		return None
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('SELECT id FROM hosts WHERE user = ? AND host = ?;', (user_id, host))
+		result = cursor.fetchone()
+		if result is None:
+			return None
+		else:
+			return result[0]
+
+def place_user(context: Context, user: str) -> int:
+	result = get_user(context, user)
+	if result is None:
+		with context.cursor() as cursor:
+			cursor: Cursor
+			super = new_super(cursor)
+			cursor.execute('INSERT INTO users(id, user) VALUES (?, ?);', (super, user))
+			print(f'INFO: new user "{user}"', file=sys.stderr)
+			return super
+	else:
+		return result
+
+def place_host(context: Context, user: str, host: str) -> int:
+	result = get_host(context, user, host)
+	if result is None:
+		user_id = place_user(context, user)
+		with context.cursor() as cursor:
+			cursor: Cursor
+			super = new_super(cursor)
+			cursor.execute('INSERT INTO hosts(id, user, host) VALUES (?, ?, ?);', (super, user_id, host))
+			print(f'INFO: new host "{user}@{host}"', file=sys.stderr)
+			return super
+	else:
+		return result
+
+def get_node(context: Context, name: str) -> Optional[int]:
+	nodetype=get_nodetype(name)
+	if nodetype=='CA':
+		return 1
+	elif nodetype=='TA' or nodetype=='DH':
+		return 0
+	elif nodetype=='USER':
+		check_user_name(name)
+		return get_user(context, name)
+	elif nodetype=='HOST':
+		user, host = check_host_user_name(name)
+		return get_host(context, user, host)
+	else:
+		raise ValueError(f'unsupported node type {nodetype}')
+
+def place_node(context: Context, name: str) -> int:
+	nodetype=get_nodetype(name)
+	if nodetype=='CA':
+		return 1
+	elif nodetype=='TA' or nodetype=='DH':
+		return 0
+	elif nodetype=='USER':
+		check_user_name(name)
+		return place_user(context, name)
+	elif nodetype=='HOST':
+		user, host = check_host_user_name(name)
+		return place_host(context, user, host)
+	else:
+		raise ValueError(f'unsupported node type {nodetype}')
+
+
+def load_extra(context: Context, key: str) -> Optional[bytes]:
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('SELECT value FROM extras WHERE key = ?;', (key,))
+		result = cursor.fetchone()
+		if result is None:
+			return None
+		else:
+			return result[0]
+
+def save_extra(context: Context, key: str, value: Optional[bytes]):
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('DELETE FROM extras WHERE key = ?;', (key,))
+		if value is not None:
+			cursor.execute('INSERT INTO extras (key, value) VALUES (?, ?);', (key, value))
+
+def load_dh(context: Context) -> Optional[DHParameters]:
+	pem = load_extra(context, 'dh')
+	if pem is None:
+		return None
+	return serialization.load_pem_parameters(pem)
+
+def save_dh(context: Context, dh: Optional[DHParameters]):
+	if dh is None:
+		pem = None
+	else:
+		pem = dh.parameter_bytes(serialization.Encoding.PEM, serialization.ParameterFormat.PKCS3)
+	save_extra(context, 'dh', pem)
+	print(f'INFO: Diffie-Hellman parameters file updated', file=sys.stderr)
+
+def load_ta(context: Context) -> Optional[OpenVPNSecretKey]:
+	pem = load_extra(context, 'ta')
+	if pem is None:
+		return None
+	return OpenVPNSecretKey(pem)
+
+def save_ta(context: Context, ta: OpenVPNSecretKey):
+	if ta is None:
+		pem = None
+	else:
+		pem = ta.pem
+	save_extra(context, 'ta', pem)
+	print(f'INFO: OpenVPN static key file updated', file=sys.stderr)
+
+def key_fingerprint(public_key: rsa.RSAPublicKey) -> str:
+	rawKeyData = public_key.public_bytes(
+		encoding=serialization.Encoding.OpenSSH,
+		format=serialization.PublicFormat.OpenSSH,
+	)
+	m = re.match("ssh-rsa ([A-Za-z0-9+/=]+)", rawKeyData.decode("utf-8"))
+	assert m is not None
+	base64BinaryData = m.group(1).encode("utf-8")
+	rawBinaryData = base64.b64decode(base64BinaryData)
+	hexDigest = hashlib.sha256(rawBinaryData).hexdigest()
+	chunks = [ hexDigest[i:i+2] for i in range(0, len(hexDigest), 2) ]
+	return str(public_key.key_size) + " SHA256:" + ":".join(chunks) + " (RSA)"
+
+class SomeBuffer:
+	def __init__(self, thing: Union[BufferedReader, BufferedWriter], close: bool):
+		self.thing = thing
+		self.close = close
+
+	def __enter__(self) -> Union[BufferedReader, BufferedWriter]:
+		return self.thing
+
+	def __exit__(self, *exc_info):
+		if self.close:
+			self.thing.close()
+
+
+
+def myinput(prompt: str) -> str:
+	if stdin_not_free and os.path.exists("/dev/tty"):
+		source = SomeBuffer(open("/dev/tty", 'r'), True)
+	else:
+		source = SomeBuffer(sys.stdin, False)
+	with source as file:
+		print(prompt, end='', file=sys.stderr)
+		sys.stderr.flush()
+		return file.readline().removesuffix('\r\n').removesuffix('\n')
+
+def new_password() -> Union[bytes, None]:
+	while True:
+		password = myinput("new password:    ")
+		if password == "":
+			print("no password, OK", file=sys.stderr)
+			return None
+		verify = myinput("verify password: ")
+		if password == verify:
+			return bytes(password, 'utf-8')
+		print("passwords did not match", file=sys.stderr)
+
+def ask_password() -> bytes:
+	return bytes(myinput("key password: "), 'utf-8')
+
+def read_key(pem: bytes) -> rsa.RSAPrivateKey:
+	try:
+		return serialization.load_pem_private_key(pem, None)
+	except TypeError:
+		while True:
+			password = ask_password()
+			try:
+				return serialization.load_pem_private_key(pem, password)
+			except ValueError:
+				print('incorrect password', file=sys.stderr)
+			except TypeError:
+				print('empty password', file=sys.stderr)
+
+def write_key(key: rsa.RSAPrivateKey) -> bytes:
+	password = new_password()
+	if password is None:
+		encryption_algorithm=serialization.NoEncryption()
+	else:
+		encryption_algorithm=serialization.BestAvailableEncryption(password)
+	return key.private_bytes(
+		encoding=serialization.Encoding.PEM,
+		format=serialization.PrivateFormat.TraditionalOpenSSL,
+		encryption_algorithm=encryption_algorithm
+	)
+
+def load_key(context: Context, name: str) -> Optional[rsa.RSAPrivateKey]:
+	owner = get_node(context, name)
+	if owner is None:
+		return None
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('SELECT private FROM keys WHERE owner = ?;', (owner,))
+		result = cursor.fetchone()
+		if result is None:
+			return None
+		pem = result[0]
+		return read_key(pem)
+
+def save_key(context: Context, name: str, key: rsa.RSAPrivateKey) -> int:
+	owner = place_node(context, name)
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('SELECT exists(SELECT 1 FROM keys WHERE owner = ?);', (owner,))
+		if cursor.fetchone()[0] == 1:
+			print(f'WARNING: key for "{name}" rewritten', file=sys.stderr)
+	public_key = key.public_key()
+	fingerprint = key_fingerprint(public_key)
+	private = write_key(key)
+	public = public_key.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.PKCS1)
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('INSERT OR REPLACE INTO keys(owner, fingerprint, private, public) VALUES (?, ?, ?, ?);', (owner, fingerprint, private, public))
+	print(f'INFO: key for "{name}" saved', file=sys.stderr)
+	return owner
+
+def only_one(name: Name, oid) -> str:
+	attribute = name.get_attributes_for_oid(oid)
+	size = len(attribute)
+	if size > 1:
+		raise ValueError(f"certificate signature request has multiple subject values for one OID: {oid.name}")
+	elif size == 0:
+		raise ValueError(f"certificate signature request has no OID: {oid.name}")
+	else:
+		return attribute[0].value
+
+def load_cert(context: Context, name: str) -> Optional[x509.Certificate]:
+	node = get_node(context, name)
+	if node is None:
+		return None
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('SELECT data FROM certs WHERE owner = ? AND revoked = false;', (node,))
+		data = cursor.fetchone()
+		if data is None:
+			return None
+		pem = data[0]
+		return x509.load_pem_x509_certificate(pem)
+
+def revoke_cert(context: Context, owner: int):
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('UPDATE certs SET revoked = true WHERE owner = ? AND revoked = false;', (owner,))
+		cursor.execute('DELETE FROM keys WHERE owner = ?', (owner,))
+
+def revoke_item(context: Context, name: str, warn: bool = True):
+	nodetype = get_nodetype(name)
+	if nodetype == 'CA':
+		with context.cursor() as cursor:
+			cursor: Cursor
+			cursor.execute('DELETE FROM super WHERE id != 1;')
+			cursor.execute('DELETE FROM certs WHERE owner = 1;')
+			cursor.execute('DELETE FROM keys WHERE owner = 1;')
+			print('INFO: CA certificate revoked => whole database destroyed, OK?', file=sys.stderr)
+	elif nodetype == 'USER':
+		ca_key = load_key(context, '#CA')
+		ca_cert = load_cert(context, '#CA')
+		owner = get_node(context, name)
+		if owner is None:
+			if warn:
+				print(f'WARNING: attempt to revoke non existing user "{name}"', file=sys.stderr)
+			return
+		# delete all user hosts, there is no any sense to revoke them, because user cert will be revoked
+		with context.cursor() as cursor:
+			cursor: Cursor
+			cursor.execute('DELETE FROM super WHERE id in (SELECT id FROM hosts WHERE user = ?);', (owner,))
+		print(f'INFO: deleted all the hosts bound to user "{name}"', file=sys.stderr)
+		if ca_key is None or ca_cert is None:
+			# not CA => just delete it
+			with context.cursor() as cursor:
+				cursor: Cursor
+				cursor.execute('DELETE FROM super WHERE id = ?;', (owner,))
+			print(f'INFO: I am not CA => {name} certificate and key deleted', file=sys.stderr)
+		else:
+			# defenitly a CA
+			revoke_cert(context, owner)
+			print(f'INFO: revoked "{name}" certificate', file=sys.stderr)
+	elif nodetype == 'HOST':
+		user, _ = check_host_user_name(name)
+		key = load_key(context, user)
+		cert = load_cert(context, user)
+		owner = get_node(context, name)
+		if owner is None:
+			if warn:
+				print(f'WARNING: attempt to revoke non existing host "{name}"', file=sys.stderr)
+			return
+		if key is None or cert is None:
+			ca_key = load_key(context, '#CA')
+			ca_cert = load_cert(context, '#CA')
+			if ca_key is None or ca_cert is None:
+				# neither a user CA nor root CA => just delete it
+				with context.cursor() as cursor:
+					cursor: Cursor
+					cursor.execute('DELETE FROM super WHERE id = ?;', (owner,))
+				print(f'INFO: I am not CA => {name} certificate and key deleted, but why?', file=sys.stderr)
+			else:
+				# revoke using root CA
+				revoke_cert(context, owner)
+				print(f'INFO: {name} certificate and key revoked using root CA', file=sys.stderr)
+		else:
+			# revoke using user CA
+			revoke_cert(context, owner)
+			print(f'INFO: {name} certificate and key revoked using user CA', file=sys.stderr)
+	elif nodetype == 'DH':
+		save_dh(context, None)
+	elif nodetype == 'TA':
+		save_ta(context, None)
+
+def serial_to_bytes(serial: int) -> bytes:
+	dump = [(serial >> ((19 - x) << 3)) & 255 for x in range(20)]
+	return bytes(dump)
+
+def bytes_to_serial(serial: bytes) -> int:
+	result = 0
+	for i in range(len(serial)):
+		result <<= 8
+		result |= serial[i]
+	return result
+
+def check_organization(config: Configuration, subject: Name):
+	organisation = only_one(subject, NameOID.ORGANIZATION_NAME)
+	if organisation != config.organisation:
+		raise ValueError(f"wrong organization OID: {organisation}")
+	organisation_unit = only_one(subject, NameOID.ORGANIZATIONAL_UNIT_NAME)
+	if organisation_unit != config.organisation_unit:
+		raise ValueError(f"wrong organization unit name OID: {organisation_unit}")
+
+def save_cert(context: Context, cert: x509.Certificate) -> int:
+	subject = cert.subject
+	check_organization(context.config, subject)
+	name = only_one(subject, NameOID.COMMON_NAME)
+	owner = place_node(context, name)
+	with context.cursor() as cursor:
+		cursor: Cursor
+		# check certificate exists
+		cursor.execute('SELECT serial FROM certs WHERE owner = ? AND NOT revoked;', (owner,))
+		result = cursor.fetchone()
+		revoke = result is not None
+		if revoke:
+			if bytes_to_serial(result[0]) == cert.serial_number:
+				return owner
+	if revoke:
+		revoke_item(context, name)
+	fingerprint = key_fingerprint(cert.public_key())
+	serial = serial_to_bytes(cert.serial_number)
+	data = cert.public_bytes(serialization.Encoding.PEM)
+	with context.cursor() as cursor:
+		cursor: Cursor
+		cursor.execute('INSERT INTO certs(serial, owner, fingerprint, data) VALUES (?, ?, ?, ?);', (serial, owner, fingerprint, data))
+	print(f'INFO: certificate "{name}" added', file=sys.stderr)
+	return owner
+
+def create_key(context: Context, name: str) -> rsa.RSAPrivateKey:
+	key = rsa.generate_private_key(65537, 4096)
+	save_key(context, name, key)
+	return key
+
+def request_user(context: Context, user: str) -> x509.CertificateSigningRequest:
+	check_user_name(user)
+	config = context.config
+	revoke_item(context, user, False)
+	key = create_key(context, user)
+	builder = x509.CertificateSigningRequestBuilder()
+	email = config.email
+	if email is None:
+		email = f'{user}@{config.email_domain}'
+	name = Name([
+		x509.NameAttribute(NameOID.COMMON_NAME, user),
+		x509.NameAttribute(NameOID.ORGANIZATION_NAME, config.organisation),
+		x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, config.organisation_unit),
+		x509.NameAttribute(NameOID.EMAIL_ADDRESS, email),
+	])
+	builder = builder.subject_name(name)
+	return builder.sign(key, hashes.SHA512())
+
+def request_host(context: Context, user: str, host: str) -> x509.CertificateSigningRequest:
+	config = context.config
+	name = f'{user}@{host}'
+	revoke_item(context, name, False)
+	key = create_key(context, name)
+	builder = x509.CertificateSigningRequestBuilder()
+	subject = Name([
+		x509.NameAttribute(NameOID.COMMON_NAME, name),
+		x509.NameAttribute(NameOID.ORGANIZATION_NAME, config.organisation),
+		x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, config.organisation_unit)
+	])
+	builder = builder.subject_name(subject)
+	return builder.sign(key, hashes.SHA512())
+
+def request_item(context: Context, name: str) -> x509.CertificateSigningRequest:
+	nodetype = get_nodetype(name)
+	if nodetype == 'CA':
+		raise ValueError('there is no any point in requesting a self signed certificate unless you are dumb, OK?')
+	elif nodetype == 'TA':
+		raise ValueError('OK, you are allowed to make OpenVPN static key; do it')
+	elif nodetype == 'DH':
+		raise ValueError('nobody wants to wait until DH parameters will be ready; you got to do it, OK?')
+	elif nodetype == 'USER':
+		return request_user(context, name)
+	elif nodetype == 'HOST':
+		user, host = check_host_user_name(name)
+		return request_host(context, user, host)
+
+def sign_user(context: Context, csr: x509.CertificateSigningRequest):
+	ca_cert = load_cert(context, '#CA')
+	ca_private_key = load_key(context, '#CA')
+	if ca_cert is None or ca_private_key is None:
+		raise ValueError('root CA certificate and key are required to sign user certificate')
+	user_public_key = csr.public_key()
+	ca_public_key = ca_cert.public_key()
+	cert_builder = x509.CertificateBuilder()
+	user_subject: Name = csr.subject
+	user = only_one(user_subject, NameOID.COMMON_NAME)
+	check_user_name(user)
+	check_organization(context.config, user_subject)
+	cert_builder = cert_builder.subject_name(user_subject)
+	cert_builder = cert_builder.issuer_name(ca_cert.subject)
+	serial = x509.random_serial_number()
+	cert_builder = cert_builder.serial_number(serial)
+	cert_builder = cert_builder.public_key(user_public_key)
+	today = datetime.datetime.today()
+	cert_builder = cert_builder.not_valid_before(today - one_day)
+	cert_builder = cert_builder.not_valid_after(today + (one_day * 3650))
+	cert_builder = cert_builder.add_extension(
+		x509.BasicConstraints(True, 1),
+		critical=True
+	)
+	cert_builder = cert_builder.add_extension(
+		x509.KeyUsage(
+			digital_signature=False,
+			content_commitment=False,
+			key_encipherment=False,
+			data_encipherment=False,
+			key_agreement=False,
+			key_cert_sign=True,
+			crl_sign=True,
+			encipher_only=False,
+			decipher_only=False
+		),
+		critical=False
+	)
+	keyid = x509.SubjectKeyIdentifier.from_public_key(user_public_key)
+	cert_builder = cert_builder.add_extension(keyid, critical=False)
+	cert_builder = cert_builder.add_extension(
+		x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_public_key),
+		critical=False
+	)
+	cert = cert_builder.sign(ca_private_key, hashes.SHA512())
+	save_cert(context, cert)
+
+def sign_server(context: Context, csr: x509.CertificateSigningRequest):
+	print('INFO: secret server certificate feature', file=sys.stderr)
+	subject: Name = csr.subject
+	name = only_one(subject, NameOID.COMMON_NAME)
+	check_host_user_name(name)
+	ca_cert = load_cert(context, '#CA')
+	ca_private_key = load_key(context, '#CA')
+	if ca_cert is None or ca_private_key is None:
+		raise ValueError('root CA certificate and key are required to sign server certificate')
+	host_public_key = csr.public_key()
+	ca_public_key = ca_cert.public_key()
+	cert_builder = x509.CertificateBuilder()
+	check_organization(context.config, subject)
+	cert_builder = cert_builder.subject_name(subject)
+	cert_builder = cert_builder.issuer_name(ca_cert.subject)
+	serial = x509.random_serial_number()
+	cert_builder = cert_builder.serial_number(serial)
+	cert_builder = cert_builder.public_key(host_public_key)
+	today = datetime.datetime.today()
+	cert_builder = cert_builder.not_valid_before(today - one_day)
+	cert_builder = cert_builder.not_valid_after(today + (one_day * 365))
+	cert_builder = cert_builder.add_extension(
+		x509.BasicConstraints(False, None),
+		critical=True
+	)
+	cert_builder = cert_builder.add_extension(
+		x509.KeyUsage(
+			digital_signature=True,
+			content_commitment=False,
+			key_encipherment=True,
+			data_encipherment=False,
+			key_agreement=False,
+			key_cert_sign=False,
+			crl_sign=False,
+			encipher_only=False,
+			decipher_only=False
+		),
+		critical=False
+	)
+	cert_builder = cert_builder.add_extension(
+		x509.ExtendedKeyUsage(
+			[ExtendedKeyUsageOID.SERVER_AUTH]
+		),
+		critical=False
+	)
+	keyid = x509.SubjectKeyIdentifier.from_public_key(host_public_key)
+	cert_builder = cert_builder.add_extension(keyid, critical=False)
+	cert_builder = cert_builder.add_extension(
+		x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_public_key),
+		critical=False
+	)
+	cert = cert_builder.sign(ca_private_key, hashes.SHA512())
+	save_cert(context, cert)
+
+def sign_host(context: Context, csr: x509.CertificateSigningRequest):
+	if os.environ.get('VPNCRT_SERVER') is not None:
+		sign_server(context, csr)
+		return
+	subject: Name = csr.subject
+	name = only_one(subject, NameOID.COMMON_NAME)
+	user, _ = check_host_user_name(name)
+	user_cert = load_cert(context, user)
+	user_private_key = load_key(context, user)
+	if user_cert is None or user_private_key is None:
+		raise ValueError(f'user "{user}" CA certificate and key are required to sign host certificate')
+	host_public_key = csr.public_key()
+	user_public_key = user_cert.public_key()
+	cert_builder = x509.CertificateBuilder()
+	check_organization(context.config, subject)
+	cert_builder = cert_builder.subject_name(subject)
+	cert_builder = cert_builder.issuer_name(user_cert.subject)
+	serial = x509.random_serial_number()
+	cert_builder = cert_builder.serial_number(serial)
+	cert_builder = cert_builder.public_key(host_public_key)
+	today = datetime.datetime.today()
+	cert_builder = cert_builder.not_valid_before(today - one_day)
+	cert_builder = cert_builder.not_valid_after(today + (one_day * 365))
+	cert_builder = cert_builder.add_extension(
+		x509.BasicConstraints(False, None),
+		critical=True
+	)
+	cert_builder = cert_builder.add_extension(
+		x509.KeyUsage(
+			digital_signature=True,
+			content_commitment=False,
+			key_encipherment=False,
+			data_encipherment=False,
+			key_agreement=False,
+			key_cert_sign=False,
+			crl_sign=False,
+			encipher_only=False,
+			decipher_only=False
+		),
+		critical=False
+	)
+	cert_builder = cert_builder.add_extension(
+		x509.ExtendedKeyUsage(
+			[ExtendedKeyUsageOID.CLIENT_AUTH]
+		),
+		critical=False
+	)
+	keyid = x509.SubjectKeyIdentifier.from_public_key(host_public_key)
+	cert_builder = cert_builder.add_extension(keyid, critical=False)
+	cert_builder = cert_builder.add_extension(
+		x509.AuthorityKeyIdentifier.from_issuer_public_key(user_public_key),
+		critical=False
+	)
+	cert = cert_builder.sign(user_private_key, hashes.SHA512())
+	save_cert(context, cert)
+
+def sign_item(context: Context, request: x509.CertificateSigningRequest):
+	subject = request.subject
+	if not request.is_signature_valid:
+		raise ValueError(f'invalid signature: {subject.rfc4514_string()}')
+	name = only_one(subject, NameOID.COMMON_NAME)
+	nodetype = get_nodetype(name)
+	if nodetype == 'USER':
+		sign_user(context, request)
+	elif nodetype == 'HOST':
+		sign_host(context, request)
+	elif nodetype == 'CA':
+		raise ValueError(f'you are not a God to sign root CA certificates')
+	else:
+		raise ValueError(f'unsupported common name "{name}" in certificate signing request')
+
+def create_ca(context: Context):
+	config = context.config
+	key = create_key(context, '#CA')
+	public = key.public_key()
+	cert_builder = x509.CertificateBuilder()
+	subject = Name([
+		x509.NameAttribute(NameOID.COMMON_NAME, u'#CA'),
+		x509.NameAttribute(NameOID.ORGANIZATION_NAME, config.organisation),
+		x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, config.organisation_unit),
+		x509.NameAttribute(NameOID.EMAIL_ADDRESS, f'admin@{config.email_domain}'),
+	])
+	cert_builder = cert_builder.subject_name(subject)
+	cert_builder = cert_builder.issuer_name(subject)
+	serial = x509.random_serial_number()
+	cert_builder = cert_builder.serial_number(serial)
+	cert_builder = cert_builder.public_key(public)
+	today = datetime.datetime.today()
+	cert_builder = cert_builder.not_valid_before(today - one_day)
+	cert_builder = cert_builder.not_valid_after(today + (one_day * 3650))
+	cert_builder = cert_builder.add_extension(
+		x509.BasicConstraints(True, 2),
+		critical=True
+	)
+	cert_builder = cert_builder.add_extension(
+		x509.KeyUsage(
+			digital_signature=False,
+			content_commitment=False,
+			key_encipherment=False,
+			data_encipherment=False,
+			key_agreement=False,
+			key_cert_sign=True,
+			crl_sign=True,
+			encipher_only=False,
+			decipher_only=False
+		),
+		critical=False
+	)
+	keyid = x509.SubjectKeyIdentifier.from_public_key(public)
+	cert_builder = cert_builder.add_extension(keyid, critical=False)
+	cert_builder = cert_builder.add_extension(
+		x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(keyid),
+		critical=False
+	)
+	cert = cert_builder.sign(key, hashes.SHA512())
+	save_cert(context, cert)
+
+def create_user(context: Context, user: str):
+	request = request_user(context, user)
+	sign_user(context, request)
+	print(f'WARNING: you requested and signed user in one place; consequences and trust OK?', file=sys.stderr)
+
+def create_host(context: Context, user: str, host: str):
+	request = request_host(context, user, host)
+	sign_host(context, request)
+	print(f'WARNING: you requested and signed host in one place; do it only for your hosts, OK?', file=sys.stderr)
+
+def create_dh(context: Context):
+	print('INFO: generating Diffie-Hellman parameters... This will took a very long time...', file=sys.stdout)
+	dh = generate_parameters(5, 4096)
+	save_dh(context, dh)
+
+def create_ta(context: Context):
+	exe = 'openvpn --genkey secret ta.key'
+	print(f'WARNING: run command by yourself, OK: {exe}', file=sys.stdout)
+	print(f'WARNING: then import ta.key: ./vpncrt import --in ta.key', file=sys.stdout)
+
+def create_item(context: Context, name: str):
+	nodetype = get_nodetype(name)
+	if nodetype == 'CA':
+		create_ca(context)
+	elif nodetype == 'TA':
+		create_ta(context)
+	elif nodetype == 'DH':
+		create_dh(context)
+	elif nodetype == 'USER':
+		create_user(context, name)
+	elif nodetype == 'HOST':
+		user, host = check_host_user_name(name)
+		create_host(context, user, host)
+
+def read_pem(pem: bytes) -> List:
+	objects = []
+	i=0
+	while True:
+		begin = pem.find(b'-----BEGIN ', i)
+		if begin == -1:
+			break
+		begin_end = pem.find(b'----', begin + 11)
+		if begin_end == -1:
+			break
+		block_type = str(pem[begin + 11 : begin_end], 'utf-8')
+		endstr = bytes(f'-----END {block_type}-----', 'utf-8')
+		end = pem.find(endstr, begin_end + 5)
+		if end == -1:
+			break
+		i = end + len(endstr)
+		block = pem[begin : i]
+		if block_type == "OpenVPN Static key V1":
+			objects.append(OpenVPNSecretKey(block))
+		elif block_type == "CERTIFICATE":
+			objects.append(x509.load_pem_x509_certificate(block))
+		elif block_type == "RSA PRIVATE KEY":
+			objects.append(read_key(block))
+		elif block_type == "DH PARAMETERS":
+			objects.append(serialization.load_pem_parameters(block))
+		elif block_type == "CERTIFICATE REQUEST":
+			objects.append(x509.load_pem_x509_csr(block))
+		else:
+			print(f"WARNING: unsupported pem block \"{block_type}\"", file=sys.stderr)
+	return objects
+
+def import_item(context: Context, item: Any) -> bool:
+	if isinstance(item, OpenVPNSecretKey):
+		save_ta(context, item)
+		return True
+	elif isinstance(item, x509.Certificate):
+		save_cert(context, item)
+		return True
+	elif isinstance(item, rsa.RSAPrivateKey):
+		fingerprint = key_fingerprint(item.public_key())
+		while True:
+			name = myinput(f'who owns this key? ({fingerprint}): ')
+			if name == "":
+				print("OK, nobody owns key, ommiting...")
+				return False
+			try:
+				save_key(context, name, item)
+				return True
+			except ValueError as e:
+				print(f"incorrect owner, try again: {e}")
+	elif isinstance(item, DHParameters):
+		save_dh(context, item)
+		return True
+
+def cert2str(cert: x509.Certificate) -> str:
+	return str(cert.public_bytes(serialization.Encoding.PEM), 'ascii')
+
+def build_ovpn(context: Context, name: str) -> OpenVPNConfiguration:
+	config = context.config
+	i = config.server.find(':')
+	if i == -1:
+		hostname = config.server
+		port = '1194'
+	else:
+		hostname = config.server[:i]
+		port = config.server[i+1:]
+	def missing(what: str):
+		raise ValueError(f'failed to create OpenVPN configuration: missing {what}')
+	ta = load_ta(context)
+	if ta is None:
+		missing('OpenVPN static key')
+	ca = load_cert(context, '#CA')
+	if ca is None:
+		missing('root CA certificate')
+	cert = load_cert(context, name)
+	if cert is None:
+		missing(f'host certificate "{name}"')
+	user, _ = check_host_user_name(name)
+	issuer = load_cert(context, user)
+	if issuer is None:
+		missing(f'user CA certificate "{user}"')
+	key = load_key(context, name)
+	if key is None:
+		missing(f'host private key "{key}"')
+
+	ta = str(ta.pem, 'ascii')
+	ca = cert2str(ca)
+	cert = cert2str(cert)
+	issuer = cert2str(issuer)
+	key = str(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()), 'ascii')
+	ovpn = f"""client
+dev {config.devtype}
+proto {config.protocol}
+remote {hostname} {port}
+resolv-retry infinite
+nobind
+;user nobody
+;group nogroup
+persist-key
+persist-tun
+mute-replay-warnings
+remote-cert-tls server
+key-direction 1
+verb 3
+mute 20
+
+<ca>
+{ca}</ca>
+<cert>
+{cert}{issuer}</cert>
+<key>
+{key}</key>
+<tls-auth>
+{ta}</tls-auth>
+	"""
+	return OpenVPNConfiguration(bytes(ovpn, 'utf-8'))
+
+def export_item(context: Context, parameter: str) -> List[Any]:
+	i = parameter.find(':')
+	if i == -1:
+		name = parameter
+		query = ['cert']
+	else:
+		name = parameter[:i]
+		query = []
+		for word in parameter[i+1:].split(','):
+			if word != '':
+				query.append(word)
+	result = []
+	nodetype = get_nodetype(name)
+	def not_found(what: str):
+		print(f'WARNING: {what} not found', file=sys.stderr)
+	def append_cert():
+		cert = load_cert(context, name)
+		if cert is None:
+			not_found(f'certificate "{name}"')
+		else:
+			result.append(cert)
+	def append_key():
+		key = load_key(context, name)
+		if key is None:
+			not_found(f'private key "{name}"')
+		else:
+			result.append(key)
+	def non_exportable(word:str, obj: str):
+		print(f"WARNING: unknown exportable object type \"{word}\" for {obj}", file=sys.stderr)
+	if nodetype == 'CA':
+		for word in query:
+			if word == 'cert':
+				append_cert()
+			elif word == 'key':
+				append_key()
+			else:
+				non_exportable(word, "root CA")
+	elif nodetype == 'TA':
+		ta = load_ta(context)
+		if ta is None:
+			not_found('OpenVPN Static Key')
+		else:
+			result.append(ta)
+	elif nodetype == 'DH':
+		dh = load_dh(context)
+		if dh is None:
+			not_found('Diffie-Hellman parameters')
+		else:
+			result.append(dh)
+	elif nodetype == 'HOST':
+		for word in query:
+			if word == 'cert':
+				append_cert()
+			elif word == 'key':
+				append_key()
+			elif word == 'ovpn':
+				result.append(build_ovpn(context, name))
+			else:
+				non_exportable(word, f'"{name}"')
+	elif nodetype == 'USER':
+		for word in query:
+			if word == 'cert':
+				append_cert()
+			elif word == 'key':
+				append_key()
+			else:
+				non_exportable(word, f'"{name}"')
+	return result
+
+def write_pem(item: Any) -> bytes:
+	if isinstance(item, x509.Certificate):
+		return item.public_bytes(serialization.Encoding.PEM)
+	elif isinstance(item, rsa.RSAPrivateKey):
+		return write_key(item)
+	elif isinstance(item, OpenVPNConfiguration):
+		return item.content
+	elif isinstance(item, OpenVPNSecretKey):
+		return item.pem
+	elif isinstance(item, DHParameters):
+		return item.parameter_bytes(serialization.Encoding.PEM, serialization.ParameterFormat.PKCS3)
+	else:
+		raise TypeError(f'unknown object: {item}')
+
+user_crl_candidates = """
+SELECT data FROM certs
+INNER JOIN hosts ON owner = hosts.id
+INNER JOIN users ON hosts.user = users.id
+WHERE revoked AND users.user = ?;
+"""
+
+def select_candidates(cursor: sqlite3.Cursor, today: datetime.datetime):
+	result = []
+	for (data,) in cursor.fetchall():
+		cert = x509.load_pem_x509_certificate(data)
+		if cert.not_valid_after >= today:
+			result.append(cert)
+	return result
+
+def make_crl_item(context: Context, name: str) -> Tuple[x509.CertificateRevocationList, List[x509.Certificate], x509.Certificate]:
+	nodetype = get_nodetype(name)
+	cert = load_cert(context, name)
+	key = load_key(context, name)
+	today = datetime.datetime.today()
+	if cert is None or key is None:
+		raise ValueError(f'impossible to make CRL as "{name}" key or certificate missing')
+	if nodetype == 'CA':
+		with context.cursor() as cursor:
+			cursor.execute("SELECT data FROM certs WHERE revoked;")
+			candidates = select_candidates(cursor, today)
+	elif nodetype == 'USER':
+		with context.cursor() as cursor:
+			cursor.execute(user_crl_candidates, (name,))
+			candidates = select_candidates(cursor, today)
+	else:
+		raise ValueError(f'object "{name}" is not a CA and can not revoke any certificate')
+	builder = x509.CertificateRevocationListBuilder()
+	builder = builder.issuer_name(cert.subject)
+	builder = builder.last_update(today)
+	builder = builder.next_update(today + one_day)
+	for candidate in candidates:
+		revoked = x509.RevokedCertificateBuilder().serial_number(candidate.serial_number).revocation_date(today).build()
+		builder = builder.add_revoked_certificate(revoked)
+	crl = builder.sign(key, hashes.SHA512())
+	print(f'INFO: created CRL as "{name}" with {len(crl)} certificates', file=sys.stderr)
+	return crl, candidates, cert
+
+actions = {}
+
+def action(name: Optional[str] = None):
+	def delegate(function):
+		if name is None:
+			function_name = function.__name__
+		else:
+			function_name = name
+		actions[function_name] = function
+		return function
+	return delegate
+
+def get_buffer(args: argparse.Namespace, type: str, file: TextIO, mode: str) -> SomeBuffer:
+	path = getattr(args, type)
+	if path is None:
+		return SomeBuffer(file.buffer, False)
+	else:
+		return SomeBuffer(open(path, mode), True)
+
+def source(args: argparse.Namespace) -> SomeBuffer:
+	return get_buffer(args, 'in', sys.stdin, 'rb')
+
+def destination(args: argparse.Namespace) -> SomeBuffer:
+	return get_buffer(args, 'out', sys.stdout, 'wb')
+
+@action('import')
+def import_action(context: Context, args: argparse.Namespace):
+	with source(args) as file:
+		pem = file.read()
+	items = read_pem(pem)
+	counter = 0
+	for item in items:
+		if import_item(context, item):
+			counter += 1
+	print(f'INFO: imported {counter} items', file=sys.stderr)
+
+@action()
+def export(context: Context, args: argparse.Namespace):
+	items = []
+	for item in args.item:
+		items += export_item(context, item)
+	with destination(args) as file:
+		for item in items:
+			pem = write_pem(item)
+			file.write(pem)
+	print(f'INFO: exported {len(items)} items', file=sys.stderr)
+
+@action()
+def revoke(context: Context, args: argparse.Namespace):
+	for item in args.item:
+		revoke_item(context, item)
+
+@action()
+def create(context: Context, args: argparse.Namespace):
+	for item in args.item:
+		create_item(context, item)
+
+@action()
+def request(context: Context, args: argparse.Namespace):
+	with destination(args) as file:
+		for item in args.item:
+			request = request_item(context, item)
+			pem = request.public_bytes(serialization.Encoding.PEM)
+			file.write(pem)
+
+@action()
+def sign(context: Context, args: argparse.Namespace):
+	with source(args) as file:
+		pem = file.read()
+	items = read_pem(pem)
+	for item in items:
+		if isinstance(item, x509.CertificateSigningRequest):
+			sign_item(context, item)
+
+find_all_users_with_subordinate_revoked_certs = """
+	SELECT DISTINCT users.user FROM users
+	INNER JOIN hosts ON hosts.user = users.id
+	INNER JOIN certs ON certs.owner = hosts.id
+	WHERE revoked
+UNION
+	SELECT DISTINCT users.user FROM users
+	INNER JOIN certs ON certs.owner = users.id
+	INNER JOIN keys ON keys.owner = users.id
+	WHERE NOT revoked;
+"""
+
+@action('make-crl')
+def make_crl(context: Context, args: argparse.Namespace):
+	if args.all:
+		if load_key(context, '#CA') is None or load_cert(context, '#CA') is None:
+			with context.cursor() as cursor:
+				cursor.execute(find_all_users_with_subordinate_revoked_certs)
+				items = cursor.fetchall()
+		else:
+			items = ('#CA',)
+	else:
+		items = args.ca
+	crls=[]
+	appendix={}
+	for item in items:
+		crl, certs, ca = make_crl_item(context, item)
+		if item != '#CA':
+			certs += [load_cert(context, '#CA')]
+		crls.append(crl)
+		for cert in certs + [ca]:
+			appendix[cert.serial_number] = cert
+	with destination(args) as file:
+		for crl in crls:
+			pem = crl.public_bytes(serialization.Encoding.PEM)
+			file.write(pem)
+		for cert in appendix.values():
+			pem = cert.public_bytes(serialization.Encoding.PEM)
+			file.write(pem)
+
+all_certs_and_keys = """
+SELECT CASE
+    WHEN super.id = 1 THEN '#CA'
+    WHEN users.id IS NOT NULL THEN users.user
+    ELSE host_users.user || '@' || hosts.host
+END, CASE
+    WHEN certs.fingerprint IS NOT NULL THEN certs.fingerprint
+    ELSE keys.fingerprint
+END AS key_fingerprint, serial, keys.fingerprint IS NOT NULL, NOT revoked FROM super
+LEFT OUTER JOIN certs ON certs.owner = super.id
+LEFT OUTER JOIN keys ON keys.owner = super.id
+LEFT OUTER JOIN users ON users.id = super.id
+LEFT OUTER JOIN hosts ON hosts.id = super.id
+LEFT OUTER JOIN users AS host_users ON host_users.id = hosts.user
+WHERE key_fingerprint IS NOT NULL;
+"""
+
+@dataclass
+class FullRecord:
+	name: str
+	fingerprint: str
+	serial: Optional[str]
+	has_key: bool
+	active: bool
+
+	def __iter__(self):
+		yield self.name
+		yield self.fingerprint
+		yield self.serial
+		yield self.has_key
+		yield self.active
+
+def prepare_record(row) -> FullRecord:
+	name, fingerprint, serial_bytes, has_key, active = row
+	serial_hex: str = serial_bytes.hex()
+	serial_chunks = [ serial_hex[i:i+2] for i in range(0, len(serial_hex), 2) ]
+	serial = ':'.join(serial_chunks)
+	return FullRecord(name, fingerprint, serial, has_key == 1, active == 1)
+
+def get_all_records(context: Context) -> List[FullRecord]:
+	with context.cursor() as cursor:
+		cursor.execute(all_certs_and_keys)
+		result = cursor.fetchall()
+	return [prepare_record(row) for row in result]
+
+def get_all_extras(context: Context) -> List[str]:
+	with context.cursor() as cursor:
+		cursor.execute('SELECT key FROM extras;')
+		return [x[0] for x in cursor.fetchall()]
+
+@action('print')
+def print_action(context: Context, args: argparse.Namespace):
+	if args.extra:
+		result = bytes(','.join(get_all_extras(context)), 'utf-8')
+		with destination(args) as file:
+			file.write(result)
+			file.write(b'\n')
+	else:
+		records = get_all_records(context)
+		if not args.revoked:
+			records = list(filter(lambda r : r.active, records))
+		if args.human:
+			result = tabulate.tabulate(records, headers=['Name', 'Key Fingerprint', 'Cert Serial', 'Private', 'Active'])
+			with destination(args) as file:
+				file.write(bytes(result, 'utf-8'))
+		else:
+			with destination(args) as file:
+				with io.TextIOWrapper(file) as csvfile:
+					csvwriter = csv.writer(csvfile)
+					for row in records:
+						csvwriter.writerow(row)
+
+def default_action(context: Context, args: argparse.Namespace):
+	print('0_0', file=sys.stderr)
+
+def main(prog: str, argv: str):
+	parser = argparse.ArgumentParser(prog=prog, description='certificate and OpenVPN configuration helper')
+	parser.add_argument('--config', '-c', type=str, default='vpncrt.toml', help='configuration file')
+	parser.add_argument('--variant', '-v', type=str, default=None, help='selected configuration')
+	subparsers = parser.add_subparsers(help='sub commands', dest='choise')
+
+	# Request +
+	request_parser = subparsers.add_parser('request')
+	request_parser.add_argument('--out', '-o', type=str, default=None, help='requst PEM file destination')
+	request_parser.add_argument('item', nargs='*', type=str, help='request issuers')
+
+	# Import +
+	import_parser = subparsers.add_parser('import')
+	import_parser.add_argument('--in', '-i', type=str, default=None, help='import PEM file location')
+
+	# Export +
+	export_parser = subparsers.add_parser('export')
+	export_parser.add_argument('--out', '-o', type=str, default=None, help='exported PEM file location')
+	export_parser.add_argument('item', nargs='*', type=str, help='items to export')
+
+	# Sign +
+	sign_parser = subparsers.add_parser('sign')
+	sign_parser.add_argument('--in', '-i', type=str, default=None, help='signing request file location')
+
+	# Revoke +
+	revoke_parser = subparsers.add_parser('revoke')
+	revoke_parser.add_argument('item', nargs='*', type=str, help='certificate names to revoke')
+
+	# Make CRL +
+	make_crl_parser = subparsers.add_parser('make-crl')
+	make_crl_parser.add_argument('--out', '-o', type=str, default=None, help='CRL PEM file destination')
+	make_crl_parser.add_argument('--all', '-a', action='store_true', help='create all possible CRLs and ignore ca argument')
+	make_crl_parser.add_argument('--no-certs', action='store_true', help='do not include revoked certificates in result file')
+	make_crl_parser.add_argument('ca', type=str, nargs='*', help='responsible actor for CRL')
+
+	# Create +
+	create_parser = subparsers.add_parser('create')
+	create_parser.add_argument('item', nargs='*', type=str, help='certificate names to create and sign')
+
+	# Print
+	print_parser = subparsers.add_parser('print')
+	print_parser.add_argument('--out', '-o', type=str, default=None, help='CSV destination file')
+	print_parser.add_argument('--revoked', '-r', action='store_true', help='also print revoked certificates')
+	print_parser.add_argument('--human', '-H', action='store_true', help='print in human readable form')
+	print_parser.add_argument('--extra', '-e', action='store_true', help='extra properties')
+
+	args = parser.parse_args(argv)
+	config = load_configuration(args.config, args.variant)
+	context = Context(config)
+	if hasattr(args, 'in') and getattr(args, 'in') is None:
+		global stdin_not_free
+		stdin_not_free = True
+	prepare_database(context)
+	try:
+		action = actions.get(args.choise, default_action)
+		action(context, args)
+		# TODO: check crypto consistency before commit
+		# (keys is appliable for coresponding certs, root CA signed users, users signed hosts)
+		context.storage.commit()
+	except Exception as e:
+		context.storage.rollback()
+		if os.environ.get('DEBUG') is not None:
+			raise
+		print('ERROR:', e, file=sys.stderr)
+	finally:
+		context.storage.close()
+
+if __name__ == '__main__':
+	main(sys.argv[0], sys.argv[1:])
